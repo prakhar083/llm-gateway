@@ -40,6 +40,35 @@ const ModelAliasSchema = z.object({
   targets: z.array(TargetSchema).min(1),
 });
 
+const RuleSchema = z.object({
+  name: z.string().optional(),
+  /** Every condition present must match. */
+  when: z
+    .object({
+      /** Requested model name(s) as sent by the client. */
+      model: z.union([z.string(), z.array(z.string())]).optional(),
+      /** Header name -> exact value, or "*" for "present". Names are case-insensitive. */
+      header: z.record(z.string(), z.string()).optional(),
+      /** Keys in the request body's `metadata` object. */
+      metadata: z.record(z.string(), z.string()).optional(),
+      /** Bounds on the estimated prompt size (characters / 4). */
+      minPromptTokens: z.number().int().nonnegative().optional(),
+      maxPromptTokens: z.number().int().positive().optional(),
+    })
+    .refine((w) => Object.keys(w).length > 0, { message: "a rule needs at least one condition" }),
+  /** Model alias to use when the rule matches. */
+  route: z.string(),
+});
+
+const RetrySchema = z.object({
+  /** Attempts per target before falling over to the next one. */
+  maxAttempts: z.number().int().min(1).max(10).default(2),
+  baseDelayMs: z.number().int().nonnegative().default(250),
+  maxDelayMs: z.number().int().nonnegative().default(4_000),
+  /** HTTP statuses that are retried and then fall over. Timeouts and network errors always are. */
+  retryOn: z.array(z.number().int()).default([408, 409, 429, 500, 502, 503, 504, 529]),
+});
+
 export const ConfigSchema = z
   .object({
     server: z
@@ -54,6 +83,14 @@ export const ConfigSchema = z
       message: "at least one upstream is required",
     }),
     models: z.record(z.string(), ModelAliasSchema).default({}),
+    routing: z
+      .object({
+        rules: z.array(RuleSchema).default([]),
+        /** Allow clients to bypass aliases with `upstream/model`. */
+        allowDirect: z.boolean().default(true),
+      })
+      .prefault({}),
+    retry: RetrySchema.prefault({}),
   })
   .superRefine((cfg, ctx) => {
     for (const [alias, def] of Object.entries(cfg.models)) {
@@ -67,8 +104,15 @@ export const ConfigSchema = z
         }
       });
     }
+    cfg.routing.rules.forEach((rule, i) => {
+      if (!cfg.models[rule.route]) {
+        ctx.addIssue({ code: "custom", path: ["routing", "rules", i, "route"], message: `unknown model alias "${rule.route}"` });
+      }
+    });
   });
 
 export type GatewayConfig = z.infer<typeof ConfigSchema>;
 export type UpstreamConfig = z.infer<typeof UpstreamSchema>;
+export type RetryConfig = z.infer<typeof RetrySchema>;
+export type RoutingRule = z.infer<typeof RuleSchema>;
 export type Target = { upstream: string; model: string };

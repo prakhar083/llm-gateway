@@ -9,6 +9,8 @@ import { ClientAbortedError } from "./upstream/client.js";
 export interface AppDeps {
   config: GatewayConfig;
   logger?: Logger;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
 }
 
 export function createApp(deps: AppDeps) {
@@ -35,7 +37,7 @@ export function createApp(deps: AppDeps) {
     }
     try {
       const body = validateRequest(format, raw);
-      return await handleChat({ config, logger }, { format, body, headers: c.req.raw.headers, signal: c.req.raw.signal });
+      return await handleChat({ config, logger, sleep: deps.sleep, random: deps.random }, { format, body, headers: c.req.raw.headers, signal: c.req.raw.signal });
     } catch (err) {
       if (err instanceof GatewayError) return errorResponse(format, err);
       if (err instanceof ClientAbortedError) return new Response(null, { status: 499 });

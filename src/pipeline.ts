@@ -1,4 +1,6 @@
-import type { GatewayConfig, Target } from "./config/schema.js";
+import type { GatewayConfig } from "./config/schema.js";
+import { routeRequest } from "./routing/router.js";
+import { executeWithFallback } from "./upstream/executor.js";
 import { errorBody, GatewayError, kindForStatus, upstreamErrorMessage, type ApiFormat } from "./errors.js";
 import type { ANTRequest } from "./formats/anthropic.js";
 import type { OAIChatRequest } from "./formats/openai.js";
@@ -17,11 +19,13 @@ import {
   type Usage,
 } from "./translate/adapter.js";
 import { translatorStream } from "./translate/stream.js";
-import { callUpstream, ClientAbortedError, UpstreamTimeoutError } from "./upstream/client.js";
 
 export interface PipelineDeps {
   config: GatewayConfig;
   logger: Logger;
+  /** Injected in tests to make backoff instant and deterministic. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
 }
 
 export interface ChatCall {
@@ -52,19 +56,6 @@ export function validateRequest(format: ApiFormat, body: unknown): ClientRequest
   return format === "openai" ? (b as OAIChatRequest) : (b as unknown as ANTRequest);
 }
 
-export function resolveTargets(config: GatewayConfig, model: string): Target[] {
-  const alias = config.models[model];
-  if (alias) return alias.targets;
-  const slash = model.indexOf("/");
-  if (slash > 0 && config.upstreams[model.slice(0, slash)]) {
-    return [{ upstream: model.slice(0, slash), model: model.slice(slash + 1) }];
-  }
-  throw new GatewayError(
-    "not_found",
-    `model "${model}" is not a configured alias; use one of [${Object.keys(config.models).join(", ")}] or "<upstream>/<model>"`,
-  );
-}
-
 export function errorResponse(format: ApiFormat, err: GatewayError, headers: Record<string, string> = {}): Response {
   return Response.json(errorBody(format, err.kind, err.message), { status: err.status, headers: { ...headers, ...err.headers } });
 }
@@ -72,42 +63,44 @@ export function errorResponse(format: ApiFormat, err: GatewayError, headers: Rec
 export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Response> {
   const { config } = deps;
   const { format, body } = call;
-  const target = resolveTargets(config, body.model)[0]!;
-  const upstream = config.upstreams[target.upstream]!;
   const stream = Boolean(body.stream);
+  const decision = routeRequest(config, format, body, call.headers);
 
-  const passthroughHeaders: Record<string, string> = {};
-  if (format === "anthropic" && upstream.type === "anthropic") {
-    const version = call.headers.get("anthropic-version");
-    const beta = call.headers.get("anthropic-beta");
-    if (version) passthroughHeaders["anthropic-version"] = version;
-    if (beta) passthroughHeaders["anthropic-beta"] = beta;
-  }
+  const executed = await executeWithFallback({
+    targets: decision.targets,
+    retry: config.retry,
+    sleep: deps.sleep,
+    random: deps.random,
+    build: (target) => {
+      const upstream = config.upstreams[target.upstream]!;
+      return {
+        name: target.upstream,
+        upstream,
+        body: buildUpstreamBody(format, body, target.model, upstream),
+        stream,
+        headers: passthroughHeaders(format, upstream.type, call.headers),
+        signal: call.signal,
+      };
+    },
+  });
 
-  let result;
-  try {
-    result = await callUpstream({
-      name: target.upstream,
-      upstream,
-      body: buildUpstreamBody(format, body, target.model, upstream),
-      stream,
-      headers: passthroughHeaders,
-      signal: call.signal,
-    });
-  } catch (err) {
-    if (err instanceof UpstreamTimeoutError) throw new GatewayError("timeout", err.message);
-    if (err instanceof ClientAbortedError) throw err;
-    throw new GatewayError("upstream", (err as Error).message);
-  }
+  const { target, attempts } = executed;
+  const upstream = config.upstreams[target.upstream]!;
+  const headers: Record<string, string> = {
+    "x-gateway-route": decision.route,
+    "x-gateway-upstream": target.upstream,
+    "x-gateway-model": target.model,
+    "x-gateway-attempts": String(attempts.filter((a) => a.outcome !== "skipped").length),
+  };
 
-  const headers: Record<string, string> = { "x-gateway-upstream": target.upstream, "x-gateway-model": target.model };
-  if (!result.ok) {
+  if (!executed.ok) {
     return errorResponse(
       format,
-      new GatewayError(kindForStatus(result.status), upstreamErrorMessage(result.errorText), { status: result.status }),
+      new GatewayError(kindForStatus(executed.status), upstreamErrorMessage(executed.errorText), { status: executed.status }),
       headers,
     );
   }
+  const result = executed.result;
 
   if (result.stream === undefined) {
     // Non-streaming request, or an upstream that answered a streaming request with plain JSON.
@@ -118,6 +111,18 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
 
   const translated = result.stream.pipeThrough(sseDecoderStream()).pipeThrough(translatorStream(streamTranslator(format, upstream.type)));
   return streamResponse(format, body, translated, headers, () => {});
+}
+
+/** Same-format Anthropic traffic keeps the client's API version and beta flags. */
+function passthroughHeaders(format: ApiFormat, upstreamType: ApiFormat, headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (format === "anthropic" && upstreamType === "anthropic") {
+    const version = headers.get("anthropic-version");
+    const beta = headers.get("anthropic-beta");
+    if (version) out["anthropic-version"] = version;
+    if (beta) out["anthropic-beta"] = beta;
+  }
+  return out;
 }
 
 /**
