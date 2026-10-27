@@ -169,6 +169,23 @@ export const ConfigSchema = z
           .default({ type: "memory" }),
       })
       .prefault({}),
+    telemetry: z
+      .object({
+        serviceName: z.string().default("llm-gateway"),
+        tracing: z
+          .object({
+            enabled: z.boolean().default(false),
+            /** OTLP/HTTP traces endpoint; falls back to OTEL_EXPORTER_OTLP_TRACES_ENDPOINT. */
+            otlpEndpoint: z.string().optional(),
+            /** Fraction of root spans sampled (parent-based). */
+            sampleRatio: z.number().min(0).max(1).default(1),
+          })
+          .prefault({}),
+        metrics: z.object({ enabled: z.boolean().default(true), path: z.string().default("/metrics") }).prefault({}),
+        /** Write one JSON access-log line per request. */
+        accessLog: z.boolean().default(true),
+      })
+      .prefault({}),
     /** Merged over the built-in table. Keys are upstream model ids; a trailing `*` matches a prefix. */
     pricing: z.record(z.string(), PriceSchema).default({}),
   })
@@ -209,6 +226,7 @@ export const ConfigSchema = z
 
 export type GatewayConfig = z.infer<typeof ConfigSchema>;
 export type UpstreamConfig = z.infer<typeof UpstreamSchema>;
+export type TelemetryConfig = GatewayConfig["telemetry"];
 export type VirtualKeyConfig = z.infer<typeof VirtualKeySchema>;
 export type Price = z.infer<typeof PriceSchema>;
 export type CacheConfig = z.infer<typeof CacheSchema>;

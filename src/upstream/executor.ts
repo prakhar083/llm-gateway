@@ -12,6 +12,8 @@ export interface AttemptRecord {
   outcome: AttemptOutcome;
   status?: number;
   error?: string;
+  /** `timeout`, `network_error`, `client_aborted` or the HTTP status as a string. */
+  errorType?: string;
   durationMs: number;
 }
 
@@ -64,7 +66,7 @@ export async function executeWithFallback(opts: ExecuteOptions): Promise<Execute
     } catch (err) {
       if (!(err instanceof GatewayError)) throw err;
       firstBuildError ??= err;
-      attempts.push({ target, attempt: 0, outcome: "skipped", error: err.message, durationMs: 0 });
+      attempts.push({ target, attempt: 0, outcome: "skipped", error: err.message, errorType: "untranslatable", durationMs: 0 });
       continue;
     }
 
@@ -83,12 +85,13 @@ export async function executeWithFallback(opts: ExecuteOptions): Promise<Execute
         result = await call(scope?.headers ? { ...req, headers: { ...req.headers, ...scope.headers } } : req);
       } catch (err) {
         if (err instanceof ClientAbortedError) {
-          finish({ outcome: "fatal_error", error: err.message });
+          finish({ outcome: "fatal_error", error: err.message, errorType: "client_aborted" });
           throw err;
         }
         if (!(err instanceof UpstreamTimeoutError || err instanceof UpstreamNetworkError)) throw err;
-        finish({ outcome: "retryable_error", error: err.message });
-        last = { error: err.message, timeout: err instanceof UpstreamTimeoutError };
+        const timeout = err instanceof UpstreamTimeoutError;
+        finish({ outcome: "retryable_error", error: err.message, errorType: timeout ? "timeout" : "network_error" });
+        last = { error: err.message, timeout };
         if (attempt < retry.maxAttempts) await sleep(backoff(retry, attempt, undefined, random));
         continue;
       }
@@ -99,12 +102,12 @@ export async function executeWithFallback(opts: ExecuteOptions): Promise<Execute
       }
 
       if (!retry.retryOn.includes(result.status)) {
-        finish({ outcome: "fatal_error", status: result.status, error: upstreamErrorMessage(result.errorText) });
+        finish({ outcome: "fatal_error", status: result.status, error: upstreamErrorMessage(result.errorText), errorType: String(result.status) });
         return { ok: false, status: result.status, errorText: result.errorText, target, attempts };
       }
 
       const message = upstreamErrorMessage(result.errorText);
-      finish({ outcome: "retryable_error", status: result.status, error: message });
+      finish({ outcome: "retryable_error", status: result.status, error: message, errorType: String(result.status) });
       last = { status: result.status, error: message, timeout: false };
       if (attempt >= retry.maxAttempts) break;
       const retryAfter = parseRetryAfter(result.headers.get("retry-after"));

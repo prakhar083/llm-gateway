@@ -9,6 +9,7 @@ import type { Logger } from "./logger.js";
 import { encodeSSEComment, eventStream, sseDecoderStream, sseEncoderStream, type SSEEvent } from "./sse.js";
 import type { AccessControl, Principal } from "./auth/access.js";
 import type { PriceBook } from "./pricing.js";
+import type { RequestObserver } from "./telemetry/observer.js";
 import {
   accumulator,
   buildUpstreamBody,
@@ -17,6 +18,7 @@ import {
   toClientResponse,
   usageFilter,
   usageOf,
+  finishReasonOf,
   type ClientRequest,
   type ClientResponse,
 } from "./translate/adapter.js";
@@ -38,6 +40,7 @@ export interface ChatCall {
   body: ClientRequest;
   headers: Headers;
   principal: Principal;
+  obs: RequestObserver;
   /** Headers decided before the pipeline ran (rate-limit state). */
   responseHeaders?: Record<string, string>;
   signal?: AbortSignal;
@@ -70,19 +73,25 @@ export function errorResponse(format: ApiFormat, err: GatewayError, headers: Rec
 
 export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Response> {
   const { config, access, cache } = deps;
-  const { format, body, principal } = call;
+  const { format, body, principal, obs } = call;
   const stream = Boolean(body.stream);
   const baseHeaders: Record<string, string> = { ...call.responseHeaders };
 
   const decision = routeRequest(config, format, body, call.headers);
+  obs.routed(decision);
   baseHeaders["x-gateway-route"] = decision.route;
-  access?.authorizeRoute(principal, decision.route);
+  try {
+    access?.authorizeRoute(principal, decision.route);
+  } catch (err) {
+    obs.reject("permission");
+    throw err;
+  }
 
   // 1. cache (a hit costs nothing, so it is served even when the budget is spent)
   const plan = cache?.plan(format, body, decision.route, principal.name, call.headers);
   let cacheStatus: CacheStatus | undefined;
   if (plan && cache) {
-    const cached = await cache.lookup(plan);
+    const cached = await obs.cacheLookup(() => cache.lookup(plan));
     cacheStatus = cached.status;
     if (cached.response) {
       const headers: Record<string, string> = {
@@ -93,12 +102,18 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
       };
       if (cached.similarity !== undefined) headers["x-gateway-cache-similarity"] = cached.similarity.toFixed(4);
       if (!stream) return Response.json(cached.response, { headers });
-      return streamResponse(format, body, eventStream(responseToEvents(format, cached.response)), headers, async () => {});
+      return streamResponse(format, body, obs, eventStream(responseToEvents(format, cached.response)), headers, async () => {});
     }
   }
 
   // 2. budget
-  const remainingBefore = await access?.checkBudget(principal);
+  let remainingBefore: number | undefined;
+  try {
+    remainingBefore = await access?.checkBudget(principal);
+  } catch (err) {
+    obs.reject("budget");
+    throw err;
+  }
   if (remainingBefore !== undefined) baseHeaders["x-gateway-budget-remaining-usd"] = remainingBefore.toFixed(6);
 
   // 3. upstream, with retries and fallback
@@ -107,6 +122,7 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
     retry: config.retry,
     sleep: deps.sleep,
     random: deps.random,
+    hooks: obs.attemptHooks(body),
     build: (target) => {
       const upstream = config.upstreams[target.upstream]!;
       return {
@@ -144,6 +160,7 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
     const usage = usageOf(format, response);
     const cost = deps.pricing.cost(target.model, usage);
     if (cost === undefined) warnUnpriced(deps, target.model);
+    obs.recordResponse({ usage, cost, responseModel: response.model, responseId: response.id, finishReason: finishReasonOf(format, response) });
     const remaining = access ? await access.charge(principal, cost ?? 0) : undefined;
     if (plan && cache) cache.save(plan, response).catch((err: Error) => deps.logger.warn("cache write failed", { error: err.message }));
     return { usage, cost, remaining };
@@ -156,12 +173,12 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
     if (cost !== undefined) headers["x-gateway-cost-usd"] = cost.toFixed(8);
     if (remaining !== undefined) headers["x-gateway-budget-remaining-usd"] = remaining.toFixed(6);
     if (!stream) return Response.json(response, { headers });
-    return streamResponse(format, body, eventStream(responseToEvents(format, response)), headers, async () => {});
+    return streamResponse(format, body, obs, eventStream(responseToEvents(format, response)), headers, async () => {});
   }
 
   // Cost is only known once the stream ends, so it is appended as an SSE comment (ignored by SDKs).
   const translated = result.stream.pipeThrough(sseDecoderStream()).pipeThrough(translatorStream(streamTranslator(format, upstream.type)));
-  return streamResponse(format, body, translated, headers, async (response) => {
+  return streamResponse(format, body, obs, translated, headers, async (response) => {
     // Only complete streams are settled and cached; a truncated stream is not charged from usage it never reported.
     if (!response) return;
     const { cost } = await settle(response);
@@ -196,6 +213,7 @@ function passthroughHeaders(format: ApiFormat, upstreamType: ApiFormat, headers:
 function streamResponse(
   format: ApiFormat,
   req: ClientRequest,
+  obs: RequestObserver,
   events: ReadableStream<SSEEvent>,
   headers: Record<string, string>,
   onComplete: (res: ClientResponse | undefined) => Promise<string[] | void>,
@@ -204,6 +222,7 @@ function streamResponse(
   const tap = new TransformStream<SSEEvent, SSEEvent>({
     transform(ev, controller) {
       acc.push(ev);
+      if (isContentEvent(ev)) obs.firstToken();
       controller.enqueue(ev);
     },
   });
@@ -223,5 +242,48 @@ function streamResponse(
     .pipeThrough(translatorStream(usageFilter(format, req)))
     .pipeThrough(finalize)
     .pipeThrough(sseEncoderStream());
-  return new Response(body, { headers: { ...SSE_HEADERS, ...headers } });
+  obs.deferred = true;
+  return new Response(
+    observeLifecycle(body, {
+      done: () => obs.finish(200, acc.complete ? undefined : "stream_incomplete"),
+      cancelled: () => obs.finish(499, "client_disconnected"),
+      failed: (err) => obs.finish(502, `stream_error: ${(err as Error)?.message ?? err}`),
+    }),
+    { headers: { ...SSE_HEADERS, ...headers } },
+  );
+}
+
+/** Cheap check for "this event carries generated content" (for time-to-first-token). */
+function isContentEvent(ev: SSEEvent): boolean {
+  if (ev.event) return ev.event === "content_block_delta";
+  return /"(content|arguments)":"[^"]|"tool_calls"/.test(ev.data);
+}
+
+/**
+ * Re-wraps a stream so the observer learns how it ended: drained, cancelled by
+ * the client (propagated upstream so the provider stops generating), or failed.
+ */
+function observeLifecycle(
+  source: ReadableStream<Uint8Array>,
+  on: { done(): void; cancelled(): void; failed(err: unknown): void },
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (done) {
+          controller.close();
+          on.done();
+        } else controller.enqueue(value);
+      } catch (err) {
+        on.failed(err);
+        controller.error(err);
+      }
+    },
+    async cancel(reason) {
+      on.cancelled();
+      await reader.cancel(reason);
+    },
+  });
 }
