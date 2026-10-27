@@ -1,0 +1,69 @@
+{
+  "name": "llm-gateway",
+  "version": "0.1.0",
+  "description": "Self-hostable LLM proxy with model routing, fallbacks, semantic caching, per-key budgets and OpenTelemetry tracing.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Prakhar Vijay",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prakhar083/llm-gateway.git"
+  },
+  "homepage": "https://github.com/prakhar083/llm-gateway#readme",
+  "bugs": "https://github.com/prakhar083/llm-gateway/issues",
+  "keywords": [
+    "llm",
+    "gateway",
+    "proxy",
+    "openai",
+    "anthropic",
+    "claude",
+    "opentelemetry",
+    "semantic-cache"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "bin": {
+    "llm-gateway": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "gateway.yaml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "mock": "tsx src/testing/mock-server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "@opentelemetry/api": "~1.9.1",
+    "@opentelemetry/core": "^2.12.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.223.0",
+    "@opentelemetry/resources": "^2.12.0",
+    "@opentelemetry/sdk-trace-base": "^2.12.0",
+    "@opentelemetry/sdk-trace-node": "^2.12.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
+    "better-sqlite3": "^13.0.3",
+    "hono": "^4.13.14",
+    "prom-client": "^15.1.3",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "@types/autocannon": "^7.12.7",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.5",
+    "autocannon": "^8.0.0",
+    "openai": "^7.45.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
