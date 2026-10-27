@@ -69,6 +69,41 @@ const RetrySchema = z.object({
   retryOn: z.array(z.number().int()).default([408, 409, 429, 500, 502, 503, 504, 529]),
 });
 
+const CacheStoreSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("memory"), maxEntries: z.number().int().positive().default(10_000) }),
+  z.object({ type: z.literal("sqlite"), path: z.string().default("./llm-gateway-cache.db") }),
+]);
+
+const EmbedderSchema = z.discriminatedUnion("type", [
+  /** Any OpenAI-compatible /embeddings endpoint (OpenAI, Ollama, vLLM, TEI...). */
+  z.object({ type: z.literal("openai"), upstream: z.string(), model: z.string(), timeoutMs: z.number().int().positive().default(5_000) }),
+  /** Local feature-hashing embedder: no network, lexical similarity only. */
+  z.object({ type: z.literal("hashing"), dimensions: z.number().int().min(16).max(8192).default(512) }),
+]);
+
+const CacheSchema = z.object({
+  enabled: z.boolean().default(false),
+  ttlSeconds: z.number().int().positive().default(3_600),
+  /** Requests whose effective temperature is above this are never cached... */
+  maxTemperature: z.number().min(0).default(0),
+  /** ...where "effective" means this value when the request omits temperature (provider default is 1). */
+  defaultTemperature: z.number().min(0).default(1),
+  /** ...unless this is set. */
+  cacheNonDeterministic: z.boolean().default(false),
+  /** By default entries are partitioned per virtual key so tenants never see each other's responses. */
+  shareAcrossKeys: z.boolean().default(false),
+  store: CacheStoreSchema.default({ type: "memory", maxEntries: 10_000 }),
+  semantic: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Cosine similarity required for a semantic hit. */
+      threshold: z.number().min(0).max(1).default(0.95),
+      ttlSeconds: z.number().int().positive().optional(),
+      embedder: EmbedderSchema.default({ type: "hashing", dimensions: 512 }),
+    })
+    .prefault({}),
+});
+
 export const ConfigSchema = z
   .object({
     server: z
@@ -91,6 +126,7 @@ export const ConfigSchema = z
       })
       .prefault({}),
     retry: RetrySchema.prefault({}),
+    cache: CacheSchema.prefault({}),
   })
   .superRefine((cfg, ctx) => {
     for (const [alias, def] of Object.entries(cfg.models)) {
@@ -109,10 +145,20 @@ export const ConfigSchema = z
         ctx.addIssue({ code: "custom", path: ["routing", "rules", i, "route"], message: `unknown model alias "${rule.route}"` });
       }
     });
+    const emb = cfg.cache.semantic.embedder;
+    if (emb.type === "openai") {
+      const up = cfg.upstreams[emb.upstream];
+      if (!up) ctx.addIssue({ code: "custom", path: ["cache", "semantic", "embedder", "upstream"], message: `unknown upstream "${emb.upstream}"` });
+      else if (up.type !== "openai") {
+        ctx.addIssue({ code: "custom", path: ["cache", "semantic", "embedder", "upstream"], message: "embedder upstream must be of type openai" });
+      }
+    }
   });
 
 export type GatewayConfig = z.infer<typeof ConfigSchema>;
 export type UpstreamConfig = z.infer<typeof UpstreamSchema>;
+export type CacheConfig = z.infer<typeof CacheSchema>;
+export type EmbedderConfig = z.infer<typeof EmbedderSchema>;
 export type RetryConfig = z.infer<typeof RetrySchema>;
 export type RoutingRule = z.infer<typeof RuleSchema>;
 export type Target = { upstream: string; model: string };

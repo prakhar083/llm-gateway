@@ -5,10 +5,12 @@ import { GatewayError, type ApiFormat } from "./errors.js";
 import { createLogger, type Logger } from "./logger.js";
 import { errorResponse, handleChat, validateRequest } from "./pipeline.js";
 import { ClientAbortedError } from "./upstream/client.js";
+import { ResponseCache } from "./cache/cache.js";
 
 export interface AppDeps {
   config: GatewayConfig;
   logger?: Logger;
+  cache?: ResponseCache;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
 }
@@ -37,7 +39,7 @@ export function createApp(deps: AppDeps) {
     }
     try {
       const body = validateRequest(format, raw);
-      return await handleChat({ config, logger, sleep: deps.sleep, random: deps.random }, { format, body, headers: c.req.raw.headers, signal: c.req.raw.signal });
+      return await handleChat({ config, logger, cache: deps.cache, sleep: deps.sleep, random: deps.random }, { format, body, headers: c.req.raw.headers, signal: c.req.raw.signal });
     } catch (err) {
       if (err instanceof GatewayError) return errorResponse(format, err);
       if (err instanceof ClientAbortedError) return new Response(null, { status: 499 });
@@ -58,4 +60,22 @@ export function createApp(deps: AppDeps) {
 
   app.notFound((c) => c.json({ error: { message: `no route for ${c.req.method} ${c.req.path}`, type: "not_found" } }, 404));
   return app;
+}
+
+export interface Gateway {
+  app: ReturnType<typeof createApp>;
+  close(): Promise<void>;
+}
+
+/** Build the app together with the stateful components the config asks for. */
+export async function createGateway(opts: Omit<AppDeps, "cache">): Promise<Gateway> {
+  const logger = opts.logger ?? createLogger();
+  const cache = await ResponseCache.create(opts.config, logger);
+  const app = createApp({ ...opts, logger, cache });
+  return {
+    app,
+    close: async () => {
+      await cache?.close();
+    },
+  };
 }

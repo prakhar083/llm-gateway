@@ -1,5 +1,6 @@
 import type { GatewayConfig } from "./config/schema.js";
 import { routeRequest } from "./routing/router.js";
+import type { CacheStatus, ResponseCache } from "./cache/cache.js";
 import { executeWithFallback } from "./upstream/executor.js";
 import { errorBody, GatewayError, kindForStatus, upstreamErrorMessage, type ApiFormat } from "./errors.js";
 import type { ANTRequest } from "./formats/anthropic.js";
@@ -23,6 +24,7 @@ import { translatorStream } from "./translate/stream.js";
 export interface PipelineDeps {
   config: GatewayConfig;
   logger: Logger;
+  cache?: ResponseCache;
   /** Injected in tests to make backoff instant and deterministic. */
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -64,7 +66,28 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
   const { config } = deps;
   const { format, body } = call;
   const stream = Boolean(body.stream);
+  let cacheStatus: CacheStatus = "bypass";
   const decision = routeRequest(config, format, body, call.headers);
+
+  const plan = deps.cache?.plan(format, body, decision.route, "", call.headers);
+  if (plan && deps.cache) {
+    const cached = await deps.cache.lookup(plan);
+    if (cached.response) {
+      const headers: Record<string, string> = {
+        "x-gateway-route": decision.route,
+        "x-gateway-cache": cached.status,
+        "x-gateway-cache-age": String(cached.ageSeconds ?? 0),
+      };
+      if (cached.similarity !== undefined) headers["x-gateway-cache-similarity"] = cached.similarity.toFixed(4);
+      if (!stream) return Response.json(cached.response, { headers });
+      return streamResponse(format, body, eventStream(responseToEvents(format, cached.response)), headers, () => {});
+    }
+    cacheStatus = cached.status;
+  }
+  const save = (response: ClientResponse) => {
+    if (!plan || !deps.cache) return;
+    deps.cache.save(plan, response).catch((err: Error) => deps.logger.warn("cache write failed", { error: err.message }));
+  };
 
   const executed = await executeWithFallback({
     targets: decision.targets,
@@ -92,6 +115,7 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
     "x-gateway-model": target.model,
     "x-gateway-attempts": String(attempts.filter((a) => a.outcome !== "skipped").length),
   };
+  if (plan) headers["x-gateway-cache"] = cacheStatus;
 
   if (!executed.ok) {
     return errorResponse(
@@ -105,12 +129,16 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
   if (result.stream === undefined) {
     // Non-streaming request, or an upstream that answered a streaming request with plain JSON.
     const response = toClientResponse(format, upstream.type, result.json);
+    save(response);
     if (!stream) return Response.json(response, { headers });
     return streamResponse(format, body, eventStream(responseToEvents(format, response)), headers, () => {});
   }
 
   const translated = result.stream.pipeThrough(sseDecoderStream()).pipeThrough(translatorStream(streamTranslator(format, upstream.type)));
-  return streamResponse(format, body, translated, headers, () => {});
+  return streamResponse(format, body, translated, headers, (response) => {
+    // Only complete streams are cached; a truncated or errored stream is not.
+    if (response) save(response);
+  });
 }
 
 /** Same-format Anthropic traffic keeps the client's API version and beta flags. */

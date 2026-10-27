@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { serve } from "@hono/node-server";
-import { createApp } from "./app.js";
+import { createGateway } from "./app.js";
 import { ConfigError, loadConfigFile } from "./config/load.js";
 import { createLogger, type LogLevel } from "./logger.js";
 
@@ -24,14 +24,15 @@ async function main() {
     throw err;
   }
 
-  const app = createApp({ config, logger });
+  const gateway = await createGateway({ config, logger });
+  const { app } = gateway;
   const server = serve({ fetch: app.fetch, hostname: config.server.host, port: config.server.port }, (info) =>
     logger.info("llm-gateway listening", { address: info.address, port: info.port, config: path }),
   );
 
   const shutdown = (signal: string) => {
     logger.info("shutting down", { signal });
-    server.close(() => process.exit(0));
+    server.close(() => void gateway.close().finally(() => process.exit(0)));
     setTimeout(() => process.exit(0), 10_000).unref();
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
