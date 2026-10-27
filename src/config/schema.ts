@@ -104,6 +104,31 @@ const CacheSchema = z.object({
     .prefault({}),
 });
 
+const VirtualKeySchema = z.object({
+  /** Stable identifier used in metrics, logs and the spend ledger. */
+  name: z.string().regex(/^[A-Za-z0-9_.-]+$/, "key names may only contain letters, digits, _ . -"),
+  /** The secret clients send as `Authorization: Bearer ...` or `x-api-key`. Use ${ENV} interpolation. */
+  key: z.string().min(1),
+  budgetUsdMonthly: z.number().positive().optional(),
+  requestsPerMinute: z.number().positive().optional(),
+  /** Token-bucket capacity; defaults to requestsPerMinute (one minute of burst). */
+  burst: z.number().int().positive().optional(),
+  /** Allowed routes (aliases or `upstream/model`); all when omitted. */
+  models: z.array(z.string()).optional(),
+});
+
+const PriceSchema = z.object({
+  /** USD per million tokens. */
+  input: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  /** Price for prompt-cache reads; defaults to `input`. */
+  cachedInput: z.number().nonnegative().optional(),
+  /** Some models charge more above a prompt-size threshold. */
+  longContext: z
+    .object({ thresholdTokens: z.number().int().positive(), input: z.number().nonnegative(), output: z.number().nonnegative() })
+    .optional(),
+});
+
 export const ConfigSchema = z
   .object({
     server: z
@@ -127,6 +152,25 @@ export const ConfigSchema = z
       .prefault({}),
     retry: RetrySchema.prefault({}),
     cache: CacheSchema.prefault({}),
+    auth: z
+      .object({
+        keys: z.array(VirtualKeySchema).default([]),
+        /** Defaults to true when any key is configured. */
+        required: z.boolean().optional(),
+      })
+      .prefault({}),
+    budgets: z
+      .object({
+        store: z
+          .discriminatedUnion("type", [
+            z.object({ type: z.literal("memory") }),
+            z.object({ type: z.literal("sqlite"), path: z.string().default("./llm-gateway-spend.db") }),
+          ])
+          .default({ type: "memory" }),
+      })
+      .prefault({}),
+    /** Merged over the built-in table. Keys are upstream model ids; a trailing `*` matches a prefix. */
+    pricing: z.record(z.string(), PriceSchema).default({}),
   })
   .superRefine((cfg, ctx) => {
     for (const [alias, def] of Object.entries(cfg.models)) {
@@ -145,6 +189,14 @@ export const ConfigSchema = z
         ctx.addIssue({ code: "custom", path: ["routing", "rules", i, "route"], message: `unknown model alias "${rule.route}"` });
       }
     });
+    const names = new Set<string>();
+    const secrets = new Set<string>();
+    cfg.auth.keys.forEach((k, i) => {
+      if (names.has(k.name)) ctx.addIssue({ code: "custom", path: ["auth", "keys", i, "name"], message: `duplicate key name "${k.name}"` });
+      if (secrets.has(k.key)) ctx.addIssue({ code: "custom", path: ["auth", "keys", i, "key"], message: "duplicate key secret" });
+      names.add(k.name);
+      secrets.add(k.key);
+    });
     const emb = cfg.cache.semantic.embedder;
     if (emb.type === "openai") {
       const up = cfg.upstreams[emb.upstream];
@@ -157,6 +209,8 @@ export const ConfigSchema = z
 
 export type GatewayConfig = z.infer<typeof ConfigSchema>;
 export type UpstreamConfig = z.infer<typeof UpstreamSchema>;
+export type VirtualKeyConfig = z.infer<typeof VirtualKeySchema>;
+export type Price = z.infer<typeof PriceSchema>;
 export type CacheConfig = z.infer<typeof CacheSchema>;
 export type EmbedderConfig = z.infer<typeof EmbedderSchema>;
 export type RetryConfig = z.infer<typeof RetrySchema>;

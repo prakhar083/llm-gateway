@@ -6,7 +6,9 @@ import { errorBody, GatewayError, kindForStatus, upstreamErrorMessage, type ApiF
 import type { ANTRequest } from "./formats/anthropic.js";
 import type { OAIChatRequest } from "./formats/openai.js";
 import type { Logger } from "./logger.js";
-import { eventStream, sseDecoderStream, sseEncoderStream, type SSEEvent } from "./sse.js";
+import { encodeSSEComment, eventStream, sseDecoderStream, sseEncoderStream, type SSEEvent } from "./sse.js";
+import type { AccessControl, Principal } from "./auth/access.js";
+import type { PriceBook } from "./pricing.js";
 import {
   accumulator,
   buildUpstreamBody,
@@ -17,14 +19,15 @@ import {
   usageOf,
   type ClientRequest,
   type ClientResponse,
-  type Usage,
 } from "./translate/adapter.js";
 import { translatorStream } from "./translate/stream.js";
 
 export interface PipelineDeps {
   config: GatewayConfig;
   logger: Logger;
+  pricing: PriceBook;
   cache?: ResponseCache;
+  access?: AccessControl;
   /** Injected in tests to make backoff instant and deterministic. */
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -34,6 +37,9 @@ export interface ChatCall {
   format: ApiFormat;
   body: ClientRequest;
   headers: Headers;
+  principal: Principal;
+  /** Headers decided before the pipeline ran (rate-limit state). */
+  responseHeaders?: Record<string, string>;
   signal?: AbortSignal;
 }
 
@@ -63,32 +69,39 @@ export function errorResponse(format: ApiFormat, err: GatewayError, headers: Rec
 }
 
 export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Response> {
-  const { config } = deps;
-  const { format, body } = call;
+  const { config, access, cache } = deps;
+  const { format, body, principal } = call;
   const stream = Boolean(body.stream);
-  let cacheStatus: CacheStatus = "bypass";
-  const decision = routeRequest(config, format, body, call.headers);
+  const baseHeaders: Record<string, string> = { ...call.responseHeaders };
 
-  const plan = deps.cache?.plan(format, body, decision.route, "", call.headers);
-  if (plan && deps.cache) {
-    const cached = await deps.cache.lookup(plan);
+  const decision = routeRequest(config, format, body, call.headers);
+  baseHeaders["x-gateway-route"] = decision.route;
+  access?.authorizeRoute(principal, decision.route);
+
+  // 1. cache (a hit costs nothing, so it is served even when the budget is spent)
+  const plan = cache?.plan(format, body, decision.route, principal.name, call.headers);
+  let cacheStatus: CacheStatus | undefined;
+  if (plan && cache) {
+    const cached = await cache.lookup(plan);
+    cacheStatus = cached.status;
     if (cached.response) {
       const headers: Record<string, string> = {
-        "x-gateway-route": decision.route,
+        ...baseHeaders,
         "x-gateway-cache": cached.status,
         "x-gateway-cache-age": String(cached.ageSeconds ?? 0),
+        "x-gateway-cost-usd": "0",
       };
       if (cached.similarity !== undefined) headers["x-gateway-cache-similarity"] = cached.similarity.toFixed(4);
       if (!stream) return Response.json(cached.response, { headers });
-      return streamResponse(format, body, eventStream(responseToEvents(format, cached.response)), headers, () => {});
+      return streamResponse(format, body, eventStream(responseToEvents(format, cached.response)), headers, async () => {});
     }
-    cacheStatus = cached.status;
   }
-  const save = (response: ClientResponse) => {
-    if (!plan || !deps.cache) return;
-    deps.cache.save(plan, response).catch((err: Error) => deps.logger.warn("cache write failed", { error: err.message }));
-  };
 
+  // 2. budget
+  const remainingBefore = await access?.checkBudget(principal);
+  if (remainingBefore !== undefined) baseHeaders["x-gateway-budget-remaining-usd"] = remainingBefore.toFixed(6);
+
+  // 3. upstream, with retries and fallback
   const executed = await executeWithFallback({
     targets: decision.targets,
     retry: config.retry,
@@ -110,12 +123,12 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
   const { target, attempts } = executed;
   const upstream = config.upstreams[target.upstream]!;
   const headers: Record<string, string> = {
-    "x-gateway-route": decision.route,
+    ...baseHeaders,
     "x-gateway-upstream": target.upstream,
     "x-gateway-model": target.model,
     "x-gateway-attempts": String(attempts.filter((a) => a.outcome !== "skipped").length),
   };
-  if (plan) headers["x-gateway-cache"] = cacheStatus;
+  if (cacheStatus) headers["x-gateway-cache"] = cacheStatus;
 
   if (!executed.ok) {
     return errorResponse(
@@ -126,19 +139,41 @@ export async function handleChat(deps: PipelineDeps, call: ChatCall): Promise<Re
   }
   const result = executed.result;
 
+  /** Price the response, charge the key and remember it in the cache. */
+  const settle = async (response: ClientResponse) => {
+    const usage = usageOf(format, response);
+    const cost = deps.pricing.cost(target.model, usage);
+    if (cost === undefined) warnUnpriced(deps, target.model);
+    const remaining = access ? await access.charge(principal, cost ?? 0) : undefined;
+    if (plan && cache) cache.save(plan, response).catch((err: Error) => deps.logger.warn("cache write failed", { error: err.message }));
+    return { usage, cost, remaining };
+  };
+
   if (result.stream === undefined) {
     // Non-streaming request, or an upstream that answered a streaming request with plain JSON.
     const response = toClientResponse(format, upstream.type, result.json);
-    save(response);
+    const { cost, remaining } = await settle(response);
+    if (cost !== undefined) headers["x-gateway-cost-usd"] = cost.toFixed(8);
+    if (remaining !== undefined) headers["x-gateway-budget-remaining-usd"] = remaining.toFixed(6);
     if (!stream) return Response.json(response, { headers });
-    return streamResponse(format, body, eventStream(responseToEvents(format, response)), headers, () => {});
+    return streamResponse(format, body, eventStream(responseToEvents(format, response)), headers, async () => {});
   }
 
+  // Cost is only known once the stream ends, so it is appended as an SSE comment (ignored by SDKs).
   const translated = result.stream.pipeThrough(sseDecoderStream()).pipeThrough(translatorStream(streamTranslator(format, upstream.type)));
-  return streamResponse(format, body, translated, headers, (response) => {
-    // Only complete streams are cached; a truncated or errored stream is not.
-    if (response) save(response);
+  return streamResponse(format, body, translated, headers, async (response) => {
+    // Only complete streams are settled and cached; a truncated stream is not charged from usage it never reported.
+    if (!response) return;
+    const { cost } = await settle(response);
+    return cost === undefined ? [] : [encodeSSEComment(`x-gateway-cost-usd=${cost.toFixed(8)}`)];
   });
+}
+
+const unpricedWarned = new Set<string>();
+function warnUnpriced(deps: PipelineDeps, model: string) {
+  if (unpricedWarned.has(model)) return;
+  unpricedWarned.add(model);
+  deps.logger.warn("no price configured for model; its usage is counted as $0 against budgets", { model });
 }
 
 /** Same-format Anthropic traffic keeps the client's API version and beta flags. */
@@ -163,7 +198,7 @@ function streamResponse(
   req: ClientRequest,
   events: ReadableStream<SSEEvent>,
   headers: Record<string, string>,
-  onComplete: (res: ClientResponse | undefined, usage: Usage | undefined) => string[] | void,
+  onComplete: (res: ClientResponse | undefined) => Promise<string[] | void>,
 ): Response {
   const acc = accumulator(format);
   const tap = new TransformStream<SSEEvent, SSEEvent>({
@@ -173,14 +208,14 @@ function streamResponse(
     },
   });
   const finalize = new TransformStream<SSEEvent, SSEEvent | string>({
-    flush(controller) {
+    async flush(controller) {
       let res: ClientResponse | undefined;
       try {
         res = acc.complete ? acc.result() : undefined;
       } catch {
         res = undefined;
       }
-      for (const comment of onComplete(res, res ? usageOf(format, res) : undefined) ?? []) controller.enqueue(comment);
+      for (const comment of (await onComplete(res)) ?? []) controller.enqueue(comment);
     },
   });
   const body = events
