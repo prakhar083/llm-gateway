@@ -1,0 +1,13 @@
+# Benchmark config: the gateway in front of the local mock upstream.
+server: { port: 18181 }
+upstreams:
+  mock-openai: { type: openai, baseUrl: "http://127.0.0.1:18282/v1" }
+  mock-anthropic: { type: anthropic, baseUrl: "http://127.0.0.1:18282" }
+models:
+  passthrough: { targets: [mock-openai/gpt-bench] }
+  translated: { targets: [mock-anthropic/claude-sonnet-5-5] }
+cache: { enabled: true }
+telemetry:
+  tracing: { enabled: false }
+  metrics: { enabled: true }
+  accessLog: false
