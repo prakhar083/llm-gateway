@@ -14,7 +14,7 @@ const UpstreamSchema = z.object({
   /** anthropic only: `max_tokens` is required by the Messages API; used when the client omits it. */
   defaultMaxTokens: z.number().int().positive().default(4096),
   /**
-   * anthropic only: forward temperature/top_p/top_k from OpenAI-format requests.
+   * anthropic only: forward temperature/top_p from OpenAI-format requests.
    * Off by default because current Claude models reject non-default sampling parameters.
    */
   forwardSamplingParams: z.boolean().default(false),
@@ -134,7 +134,8 @@ export const ConfigSchema = z
     server: z
       .object({
         host: z.string().default("0.0.0.0"),
-        port: z.number().int().min(0).max(65535).default(8080),
+        // coerced so it can come from the environment: `port: ${PORT:-8080}`
+        port: z.coerce.number().int().min(0).max(65535).default(8080),
         /** Max accepted request body in bytes. */
         bodyLimitBytes: z.number().int().positive().default(10 * 1024 * 1024),
       })

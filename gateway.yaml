@@ -1,0 +1,102 @@
+# llm-gateway configuration: real providers.
+# Secrets come from the environment: ${VAR} is required, ${VAR:-default} is optional.
+# For a keyless local demo against the bundled mock upstream, see config/gateway.demo.yaml.
+
+server:
+  host: 0.0.0.0
+  port: "${PORT:-8080}"
+
+upstreams:
+  anthropic:
+    type: anthropic
+    baseUrl: https://api.anthropic.com
+    apiKey: ${ANTHROPIC_API_KEY}
+    timeoutMs: 120000
+  openai:
+    type: openai
+    baseUrl: https://api.openai.com/v1
+    apiKey: ${OPENAI_API_KEY}
+    maxTokensField: max_completion_tokens
+  groq:
+    type: openai
+    baseUrl: https://api.groq.com/openai/v1
+    apiKey: ${GROQ_API_KEY:-}
+    timeoutMs: 30000
+  ollama:
+    type: openai
+    baseUrl: ${OLLAMA_URL:-http://localhost:11434/v1}
+    timeoutMs: 300000
+
+# Virtual models. Clients send `model: fast`; each target is tried in order.
+models:
+  fast:
+    description: Cheap and quick; falls back to Claude Haiku if Groq is unavailable.
+    targets:
+      - groq/llama-3.3-70b-versatile
+      - anthropic/claude-haiku-5-5
+  smart:
+    targets:
+      - anthropic/claude-sonnet-5-5
+      - openai/gpt-4.1
+  deep:
+    targets:
+      - anthropic/claude-opus-5-5
+  local:
+    targets:
+      - ollama/llama3.2
+
+routing:
+  allowDirect: true # clients may also send "anthropic/claude-opus-5-5"
+  rules:
+    - name: premium-tier
+      when: { header: { x-gateway-tier: premium } }
+      route: deep
+    - name: long-prompts-to-claude
+      when: { model: [fast, smart], minPromptTokens: 60000 }
+      route: deep
+
+retry:
+  maxAttempts: 2
+  baseDelayMs: 250
+  maxDelayMs: 4000
+
+cache:
+  enabled: true
+  ttlSeconds: 3600
+  maxTemperature: 0 # only cache requests that explicitly ask for temperature 0
+  store: { type: sqlite, path: /data/cache.db }
+  semantic:
+    enabled: true
+    threshold: 0.95
+    embedder: { type: openai, upstream: openai, model: text-embedding-3-small }
+
+auth:
+  keys:
+    - name: backend
+      key: ${GATEWAY_KEY_BACKEND}
+      budgetUsdMonthly: 200
+      requestsPerMinute: 600
+    - name: prototyping
+      key: ${GATEWAY_KEY_PROTOTYPING}
+      budgetUsdMonthly: 20
+      requestsPerMinute: 30
+      models: [fast, local]
+
+budgets:
+  store: { type: sqlite, path: /data/spend.db }
+
+# USD per million tokens. Claude 5.5 models are built in; price everything else you route to,
+# using your provider's current price list (the values below are placeholders to replace).
+# Unpriced models are counted as $0 against budgets and logged/metered as unpriced.
+pricing:
+  llama-3.3-70b-versatile: { input: 0.6, output: 0.8 }
+  gpt-4.1*: { input: 2, output: 8 }
+  llama3.2: { input: 0, output: 0 } # local
+
+telemetry:
+  serviceName: llm-gateway
+  tracing:
+    enabled: true
+    otlpEndpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://localhost:4318/v1/traces}
+  metrics: { enabled: true, path: /metrics }
+  accessLog: true

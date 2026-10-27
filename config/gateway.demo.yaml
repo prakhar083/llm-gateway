@@ -1,0 +1,55 @@
+# Demo configuration used by docker-compose: two "providers" served by the bundled
+# mock upstream, so every feature can be exercised without API keys.
+
+server: { port: "${PORT:-8080}" }
+
+upstreams:
+  mock-anthropic:
+    type: anthropic
+    baseUrl: ${MOCK_URL:-http://mock-llm:9090}
+  mock-openai:
+    type: openai
+    baseUrl: ${MOCK_URL:-http://mock-llm:9090}/v1
+  # Points at nothing: demonstrates fallback when a provider is down.
+  offline:
+    type: openai
+    baseUrl: http://127.0.0.1:9/v1
+    timeoutMs: 500
+
+models:
+  fast:
+    targets: [offline/llama-3.3-70b, mock-openai/gpt-mini]
+  smart:
+    targets: [mock-anthropic/claude-sonnet-5-5, mock-openai/gpt-large]
+
+routing:
+  rules:
+    - name: premium
+      when: { header: { x-gateway-tier: premium } }
+      route: smart
+
+retry: { maxAttempts: 2, baseDelayMs: 100, maxDelayMs: 1000 }
+
+cache:
+  enabled: true
+  semantic:
+    enabled: true
+    threshold: 0.9
+    embedder: { type: hashing, dimensions: 512 }
+
+auth:
+  keys:
+    - name: demo
+      key: ${DEMO_KEY:-sk-gw-demo}
+      budgetUsdMonthly: 1
+      requestsPerMinute: 120
+
+pricing:
+  gpt-mini: { input: 0.5, output: 1.5 }
+  gpt-large: { input: 3, output: 12 }
+
+telemetry:
+  serviceName: llm-gateway-demo
+  tracing:
+    enabled: true
+    otlpEndpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-http://jaeger:4318/v1/traces}

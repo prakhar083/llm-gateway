@@ -79,3 +79,19 @@ describe("env interpolation", () => {
     }
   });
 });
+
+describe("shipped configs", () => {
+  it("gateway.yaml and the demo config are valid", async () => {
+    const { loadConfigFile } = await import("../src/config/load.js");
+    const prod = loadConfigFile("gateway.yaml", {
+      ANTHROPIC_API_KEY: "a",
+      OPENAI_API_KEY: "b",
+      GATEWAY_KEY_BACKEND: "k1",
+      GATEWAY_KEY_PROTOTYPING: "k2",
+    });
+    expect(Object.keys(prod.models)).toEqual(["fast", "smart", "deep", "local"]);
+    expect(prod.cache.semantic.embedder).toMatchObject({ type: "openai", upstream: "openai" });
+    const demo = loadConfigFile("config/gateway.demo.yaml", {});
+    expect(demo.upstreams["mock-openai"]!.baseUrl).toBe("http://mock-llm:9090/v1");
+  });
+});

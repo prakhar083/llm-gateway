@@ -1,0 +1,48 @@
+# Local demo: the gateway in front of a mock LLM provider, with traces in Jaeger.
+#   docker compose up --build
+#   gateway  http://localhost:8080  (key: sk-gw-demo)
+#   jaeger   http://localhost:16686
+# To use real providers instead, set GATEWAY_CONFIG=/app/gateway.yaml and pass the
+# API keys it references (see .env.example).
+
+services:
+  gateway:
+    build: .
+    image: llm-gateway:local
+    ports: ["8080:8080"]
+    environment:
+      GATEWAY_CONFIG: ${GATEWAY_CONFIG:-/app/config/gateway.demo.yaml}
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GATEWAY_KEY_BACKEND: ${GATEWAY_KEY_BACKEND:-}
+      GATEWAY_KEY_PROTOTYPING: ${GATEWAY_KEY_PROTOTYPING:-}
+      DEMO_KEY: ${DEMO_KEY:-sk-gw-demo}
+    volumes:
+      - gateway-data:/data
+    depends_on:
+      mock-llm: { condition: service_started }
+      jaeger: { condition: service_started }
+
+  # The same image ships the mock OpenAI/Anthropic-compatible upstream used by the tests.
+  mock-llm:
+    build: .
+    image: llm-gateway:local
+    command: ["node", "dist/testing/mock-server.js"]
+    environment:
+      PORT: "9090"
+      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-150}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9090/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+      - "4318:4318"   # OTLP/HTTP
+
+volumes:
+  gateway-data:
